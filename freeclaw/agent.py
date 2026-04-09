@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from .common import extract_finish_reason as _extract_finish_reason
+from .tool_result_validation import serialize_tool_result
 from .tools import ToolContext, dispatch_tool_call, tool_schemas
 
 log = logging.getLogger(__name__)
@@ -314,16 +315,18 @@ def run_agent(
 
             log.info("[tool] %s %s", name, args_json)
 
+            raw_result: Any
             try:
                 dispatcher = tool_dispatcher or dispatch_tool_call
-                result = dispatcher(tool_ctx, name, args_json)
-                content = json.dumps(result, ensure_ascii=True)
+                raw_result = dispatcher(tool_ctx, name, args_json)
             except Exception as e:
                 err: dict[str, Any] = {"ok": False, "tool": name, "error": str(e)}
                 # Attach raw arguments to help the model self-correct (bounded).
                 if args_json and len(args_json) <= 4000:
                     err["arguments_json"] = args_json
-                content = json.dumps(err, ensure_ascii=True)
+                raw_result = err
+
+            content = serialize_tool_result(name, raw_result)
 
             log.info("[tool-result] %s", content[:4000])
 

@@ -12,6 +12,7 @@ class NimChatClient:
     base_url: str
     api_key: str
     model: str | None
+    routing_default_pin: str | None = None
     timeout_s: float = 120.0
     _resolved_model: str | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -22,7 +23,12 @@ class NimChatClient:
             raise SystemExit(
                 "Missing NVIDIA API key. Set NVIDIA_API_KEY (or NIM_API_KEY / NVIDIA_NIM_API_KEY)."
             )
-        return NimChatClient(base_url=cfg.base_url.rstrip("/"), api_key=api_key, model=cfg.model)
+        return NimChatClient(
+            base_url=cfg.base_url.rstrip("/"),
+            api_key=api_key,
+            model=cfg.model,
+            routing_default_pin=(getattr(cfg, "routing_default_pin", None) or None),
+        )
 
     def with_model(self, model: str | None) -> "NimChatClient":
         if model == self.model:
@@ -31,6 +37,7 @@ class NimChatClient:
             base_url=self.base_url,
             api_key=self.api_key,
             model=model,
+            routing_default_pin=self.routing_default_pin,
             timeout_s=self.timeout_s,
         )
 
@@ -91,7 +98,13 @@ class NimChatClient:
             max_tokens=max_tokens,
             tools=tools,
         )
-        return post_json(url, headers=self._headers(), payload=payload, timeout_s=self.timeout_s).json
+        return post_json(
+            url,
+            headers=self._headers(),
+            payload=payload,
+            timeout_s=self.timeout_s,
+            route_hint={"default_pin": self.routing_default_pin},
+        ).json
 
     @staticmethod
     def extract_text(resp: dict[str, Any]) -> str:

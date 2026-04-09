@@ -61,9 +61,14 @@ Defaults are NIM-first. Override with env vars:
 - `FREECLAW_TIMER_DISCORD_CONTEXT_MAX_MESSAGES` (default: `24`; max recent user/assistant messages to include)
 - `FREECLAW_TIMER_DISCORD_CONTEXT_MAX_CHARS` (default: `12000`; char budget for injected Discord context)
 - `FREECLAW_DISCORD_SESSION_SCOPE` (default: `channel`; options: `channel`, `user`, `global`; controls how Discord conversation history is shared)
+- `FREECLAW_ROUTING_DEFAULT_PIN` (optional: `heavy` or `light`; sets a per-agent default route pin, bypassing heuristics)
+- `FREECLAW_ROUTING_CONFIG_PATH` (optional; override path to routing config JSON, default: `./config/routing.json`)
+- `FREECLAW_ROUTING_TOKEN_THRESHOLD` (default: `3000`; route to heavy model when estimated prompt token budget exceeds this)
+- `FREECLAW_ROUTE_LOG_PATH` (default: `/tmp/freeclaw-route.log`; every NIM route decision is appended here)
 - `FREECLAW_TOOL_MAX_READ_BYTES` (default: `200000`)
 - `FREECLAW_TOOL_MAX_WRITE_BYTES` (default: `2000000`)
 - `FREECLAW_TOOL_MAX_LIST_ENTRIES` (default: `2000`)
+- `FREECLAW_TOOL_RESULT_MAX_CHARS` (default: `12000`; truncation cap for validated tool result payloads injected back into context)
 - `FREECLAW_ASSISTANT_NAME` (default: `Freebot`)
 - `FREECLAW_ASSISTANT_TONE` (default: `Direct, pragmatic, concise...`)
 - `FREECLAW_WEB_MAX_BYTES` (default: `500000`)
@@ -85,6 +90,15 @@ Defaults are NIM-first. Override with env vars:
 - `FREECLAW_LOG_LEVEL` (default: `info`)
 - `FREECLAW_LOG_FILE` (default: `./config/freeclaw.log`; set to empty string to disable file logging)
 - `FREECLAW_LOG_FORMAT` (default: `text`; options: `text`, `jsonl`)
+- `FREECLAW_BACKUP_STATUS_PATH` (default: `/tmp/freeclaw_backup_status.json`; used by `!status` to report last successful backup)
+- `FREECLAW_KAGGLE_SESSION_START_EPOCH` (optional; if set, `!status` reports 12-hour Kaggle session countdown from this epoch)
+
+Routing config files (hot-reloaded):
+
+- Base: `./config/routing.json`
+- Per-agent override: `./config/agents/<agent>/routing.json`
+
+Use per-agent `routing.json` to override markers (`browser_markers`, `heavy_keywords`, `tool_or_env_markers`) and model routing defaults without editing code.
 
 Workspace safety:
 - If `workspace_dir` resolves to filesystem root (`/`), freeclaw now falls back to `<cwd>/workspace` to prevent creating `/.freeclaw`.
@@ -392,6 +406,15 @@ Commands:
 - `!claw new` start a new conversation (keeps settings)
 - `!claw reset` clear the per-channel/DM session (messages + settings)
 - `!claw help` show available commands
+- `!heavy <prompt>` force heavy routed model for one message
+- `!light <prompt>` force light routed model for one message
+- `!status` show live health (uptime/session countdown/NIM latency/memory rows/backup/routing model)
+- `!schedule <natural-language request>` save a structured scheduled job (`scheduled_jobs.json`) for notebook timer runners
+
+Runtime behavior:
+
+- Discord reconnect uses exponential backoff with random jitter (`0.5s` to `3.0s`) per attempt.
+- Prompt execution uses priority lanes (`interactive` and `background`); interactive requests are dequeued first.
 
 Slash commands (if the bot has `applications.commands` scope and sync succeeds):
 
@@ -399,6 +422,8 @@ Slash commands (if the bot has `applications.commands` scope and sync succeeds):
 - `/claw` chat
 - `/reset` clear session (messages + settings)
 - `/new` start a new conversation (keeps settings)
+- `/status` show live health metrics
+- `/schedule` create a scheduled reminder job
 - `/tools` list tools
 - `/model` show or set model override for this channel/DM
 - `/temp` show or set temperature override for this channel/DM

@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import re
 import shlex
 import shutil
@@ -56,6 +57,7 @@ from .providers.openrouter import (
     fetch_models as openrouter_fetch_models,
     model_ids as openrouter_model_ids,
 )
+from .routing import route_pin_context
 from .skills import find_skill, iter_skills, render_enabled_skills_system
 from .tools import ToolContext, tool_schemas
 
@@ -1730,7 +1732,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
         return _build_system_prompt(core_now + (base_system or ""), skills_block)
 
     sys.stdout.write("freeclaw chat (Ctrl-D to exit)\n")
-    sys.stdout.write("Commands: /help, /new, /model [id|auto], /temp [0-2|default], /tokens [n|default]\n")
+    sys.stdout.write(
+        "Commands: /help, /new, /model [id|auto], /temp [0-2|default], /tokens [n|default], !heavy <prompt>, !light <prompt>\n"
+    )
     while True:
         try:
             user = input("> ").strip()
@@ -1761,6 +1765,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
                             "- /tokens               Show current max_tokens override.",
                             "- /tokens <n>           Set max_tokens override.",
                             "- /tokens default       Clear max_tokens override.",
+                            "- !heavy <prompt>       Force heavy routed model for one message.",
+                            "- !light <prompt>       Force light routed model for one message.",
                             "",
                         ]
                     )
@@ -1842,19 +1848,40 @@ def cmd_chat(args: argparse.Namespace) -> int:
             sys.stdout.write("Unknown command. Type /help.\n")
             continue
 
+        route_pin: str | None = None
+        raw_user = user.strip()
+        low_user = raw_user.lower()
+        if low_user == "!heavy":
+            route_pin = "heavy"
+            user = ""
+        elif low_user.startswith("!heavy "):
+            route_pin = "heavy"
+            user = raw_user[len("!heavy ") :].strip()
+        elif low_user == "!light":
+            route_pin = "light"
+            user = ""
+        elif low_user.startswith("!light "):
+            route_pin = "light"
+            user = raw_user[len("!light ") :].strip()
+
+        if not user:
+            sys.stdout.write("Prompt is empty after route pin prefix. Provide message text.\n")
+            continue
+
         messages.append({"role": "user", "content": user})
 
-        result = run_agent(
-            client=_active_client(),
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            enable_tools=(not args.no_tools),
-            tool_ctx=tool_ctx,
-            max_tool_steps=max_tool_steps,
-            verbose_tools=args.verbose_tools,
-            tools_builder=tools_builder,
-        )
+        with route_pin_context(route_pin):
+            result = run_agent(
+                client=_active_client(),
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                enable_tools=(not args.no_tools),
+                tool_ctx=tool_ctx,
+                max_tool_steps=max_tool_steps,
+                verbose_tools=args.verbose_tools,
+                tools_builder=tools_builder,
+            )
 
         sys.stdout.write(result.text)
         if not result.text.endswith("\n"):
@@ -3525,7 +3552,7 @@ def cmd_config_set(args: argparse.Namespace) -> int:
         }
         bool_keys = {"onboarded", "discord_respond_to_all", "web_ui_enabled"}
         float_keys = {"temperature"}
-        opt_str_keys = {"model", "discord_app_id"}
+        opt_str_keys = {"model", "discord_app_id", "routing_default_pin"}
         list_keys = {"skills_dirs", "enabled_skills"}
 
         if key in int_keys:
@@ -3536,7 +3563,7 @@ def cmd_config_set(args: argparse.Namespace) -> int:
             val = float(raw_val.strip())
         elif key in opt_str_keys:
             t = raw_val.strip()
-            val = None if t.lower() in {"", "none", "null", "clear", "reset"} else t
+            val = None if t.lower() in {"", "none", "null", "clear", "reset", "auto", "default"} else t
         elif key in list_keys:
             t = raw_val.strip()
             val = [] if t.lower() in {"", "none", "null"} else [x.strip() for x in t.split(",") if x.strip()]
@@ -3565,6 +3592,9 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
             "discord_session_scope must be one of: 'channel', 'user', 'global' "
             f"(got {getattr(cfg, 'discord_session_scope', None)!r})"
         )
+    route_pin = str(getattr(cfg, "routing_default_pin", "") or "").strip().lower()
+    if route_pin and route_pin not in {"heavy", "light"}:
+        errs.append("routing_default_pin must be one of: 'heavy', 'light', or null/empty")
 
     # Provider/base_url sanity checks (best-effort).
     base_url = (cfg.base_url or "").strip().rstrip("/")
@@ -3874,38 +3904,61 @@ def cmd_discord(args: argparse.Namespace) -> int:
         agent_label = (str(agent_arg).strip() if agent_arg is not None else "")
         if not agent_label:
             agent_label = (str(getattr(cfg, "assistant_name", "")).strip() or "base")
-        asyncio.run(
-            run_discord_bot(
-                token=args.token,
-                prefix=(args.prefix or cfg.discord_prefix),
-                respond_to_all=(
-                    bool(args.respond_to_all)
-                    if args.respond_to_all is not None
-                    else bool(cfg.discord_respond_to_all)
-                ),
-                system_prompt=system_prompt,
-                client=client,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tool_ctx=tool_ctx,
-                enable_tools=(not args.no_tools),
-                max_tool_steps=max_tool_steps,
-                verbose_tools=args.verbose_tools,
-                tools_builder=tools_builder,
-                history_messages=(
-                    args.history_messages
-                    if args.history_messages is not None
-                    else cfg.discord_history_messages
-                ),
-                session_scope=(
-                    args.session_scope
-                    if getattr(args, "session_scope", None) is not None
-                    else getattr(cfg, "discord_session_scope", "channel")
-                ),
-                workspace=runtime.workspace,
-                bot_label=agent_label,
-            )
-        )
+        reconnect_attempt = 0
+        reconnect_started_s = float(time.time())
+        while True:
+            try:
+                asyncio.run(
+                    run_discord_bot(
+                        token=args.token,
+                        prefix=(args.prefix or cfg.discord_prefix),
+                        respond_to_all=(
+                            bool(args.respond_to_all)
+                            if args.respond_to_all is not None
+                            else bool(cfg.discord_respond_to_all)
+                        ),
+                        system_prompt=system_prompt,
+                        client=client,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tool_ctx=tool_ctx,
+                        enable_tools=(not args.no_tools),
+                        max_tool_steps=max_tool_steps,
+                        verbose_tools=args.verbose_tools,
+                        tools_builder=tools_builder,
+                        history_messages=(
+                            args.history_messages
+                            if args.history_messages is not None
+                            else cfg.discord_history_messages
+                        ),
+                        session_scope=(
+                            args.session_scope
+                            if getattr(args, "session_scope", None) is not None
+                            else getattr(cfg, "discord_session_scope", "channel")
+                        ),
+                        workspace=runtime.workspace,
+                        bot_label=agent_label,
+                        routing_default_pin=(getattr(cfg, "routing_default_pin", None) or None),
+                    )
+                )
+                break
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                reconnect_attempt += 1
+                jitter_s = random.uniform(0.5, 3.0)
+                # 1,2,4,8,16,32,60,... + jitter
+                base_s = min(60.0, float(2 ** min(reconnect_attempt - 1, 6)))
+                delay_s = base_s + jitter_s
+                elapsed_s = float(time.time()) - reconnect_started_s
+                log.warning(
+                    "discord reconnect attempt=%d elapsed_s=%.1f sleep_s=%.1f error=%s",
+                    int(reconnect_attempt),
+                    float(elapsed_s),
+                    float(delay_s),
+                    e,
+                )
+                time.sleep(delay_s)
     finally:
         if timer_proc is not None:
             try:
@@ -4206,6 +4259,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.env_file is None:
             # Hint for onboarding; may not exist yet.
             args.env_file = str(agent_env_path(a2))
+        # Expose resolved agent context for runtime features that load per-agent sidecar config files.
+        os.environ["FREECLAW_AGENT_NAME"] = str(a2)
+        if args.config is not None:
+            os.environ["FREECLAW_AGENT_CONFIG"] = str(args.config)
 
     # If the full parser received --env-file, ensure it is loaded (in case user passes argv directly to main()).
     if args.env_file and (not pre_args.env_file or pre_args.env_file != args.env_file):
