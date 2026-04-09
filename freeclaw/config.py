@@ -55,6 +55,7 @@ class ClawConfig:
     discord_respond_to_all: bool = False
     discord_session_scope: str = "channel"
     discord_app_id: str | None = None
+    routing_default_pin: str | None = None
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> "ClawConfig":
@@ -98,6 +99,9 @@ class ClawConfig:
             discord_respond_to_all=bool(d.get("discord_respond_to_all", False)),
             discord_session_scope=(str(d.get("discord_session_scope") or "channel").strip() or "channel"),
             discord_app_id=(str(d["discord_app_id"]).strip() if d.get("discord_app_id") else None),
+            routing_default_pin=(
+                str(d["routing_default_pin"]).strip().lower() if d.get("routing_default_pin") else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -126,6 +130,7 @@ class ClawConfig:
             "discord_respond_to_all": bool(self.discord_respond_to_all),
             "discord_session_scope": self.discord_session_scope,
             "discord_app_id": (self.discord_app_id or None),
+            "routing_default_pin": (self.routing_default_pin or None),
         }
 
 
@@ -155,6 +160,7 @@ def load_config(path: str | None) -> ClawConfig:
     discord_respond_to_all = os.getenv("FREECLAW_DISCORD_RESPOND_TO_ALL")
     discord_session_scope = os.getenv("FREECLAW_DISCORD_SESSION_SCOPE")
     discord_app_id = os.getenv("FREECLAW_DISCORD_APP_ID")
+    routing_default_pin = os.getenv("FREECLAW_ROUTING_DEFAULT_PIN")
 
     return ClawConfig(
         onboarded=cfg.onboarded,
@@ -203,6 +209,11 @@ def load_config(path: str | None) -> ClawConfig:
             else cfg.discord_session_scope
         ),
         discord_app_id=(discord_app_id.strip() if discord_app_id and discord_app_id.strip() else cfg.discord_app_id),
+        routing_default_pin=(
+            routing_default_pin.strip().lower()
+            if routing_default_pin and routing_default_pin.strip()
+            else cfg.routing_default_pin
+        ),
     )
 
 
@@ -237,6 +248,7 @@ def write_default_config(path: str | None) -> Path:
         "discord_respond_to_all": False,
         "discord_session_scope": "channel",
         "discord_app_id": None,
+        "routing_default_pin": None,
     }
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     return cfg_path

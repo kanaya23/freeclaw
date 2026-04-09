@@ -8,6 +8,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from typing import Any
 from ..agent import run_agent
 from ..common import extract_finish_reason as _extract_finish_reason
 from ..common import safe_label as _safe_label
+from ..http_client import nim_latency_snapshot
 from ..google_oauth import (
     claim_google_oauth_tokens,
     get_google_oauth_status,
@@ -23,6 +25,7 @@ from ..google_oauth import (
 )
 from ..paths import config_dir as _config_dir
 from ..paths import memory_db_path as _default_memory_db_path
+from ..routing import get_last_route_decision, route_pin_context
 from ..tools import ToolContext, dispatch_tool_call, tool_schemas
 from ..tools.memory import memory_search
 
@@ -39,6 +42,8 @@ _MAX_OUTBOUND_FILE_BYTES = 8_000_000
 _MAX_OUTBOUND_TOTAL_BYTES = 20_000_000
 _TOKEN_HISTORY_RETENTION_DAYS = 7
 _DISCORD_SEND_FILE_TOOL_NAME = "discord_send_file"
+_SCHEDULED_JOBS_FILENAME = "scheduled_jobs.json"
+_SUPPORTED_CRON_NOTICE = "Supported cron patterns: minute='*|*/n|n', hour='*|n', day='*', month='*', dow='*|0-6'."
 _TEXT_ATTACHMENT_EXTS = {
     ".txt",
     ".md",
@@ -240,6 +245,134 @@ def _provider_name(client: Any) -> str:
     if "nim" in nm:
         return "nim"
     return nm or "unknown"
+
+
+def _scheduled_jobs_path(workspace: Path | None) -> Path:
+    if workspace is not None:
+        return (workspace / "mem" / _SCHEDULED_JOBS_FILENAME).resolve()
+    return (_runtime_root() / _SCHEDULED_JOBS_FILENAME).resolve()
+
+
+def _extract_json_object_from_text(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", raw)
+    if m is None:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def _parse_cron_field(field: str, *, minimum: int, maximum: int) -> set[int]:
+    f = str(field or "").strip()
+    if f == "*":
+        return set(range(minimum, maximum + 1))
+    if f.startswith("*/"):
+        step = int(f[2:])
+        if step < 1:
+            raise ValueError("cron step must be >= 1")
+        return set(range(minimum, maximum + 1, step))
+
+    vals: set[int] = set()
+    for part in f.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        if "-" in p:
+            lo_s, hi_s = p.split("-", 1)
+            lo = int(lo_s)
+            hi = int(hi_s)
+            if lo > hi:
+                raise ValueError(f"invalid cron range: {p}")
+            for n in range(lo, hi + 1):
+                if n < minimum or n > maximum:
+                    raise ValueError(f"cron value out of range: {n}")
+                vals.add(n)
+            continue
+        n = int(p)
+        if n < minimum or n > maximum:
+            raise ValueError(f"cron value out of range: {n}")
+        vals.add(n)
+    if not vals:
+        raise ValueError("empty cron field")
+    return vals
+
+
+def _cron_next_run_utc(expr: str, *, now_utc: dt.datetime) -> dt.datetime | None:
+    parts = [p for p in str(expr or "").strip().split() if p]
+    if len(parts) != 5:
+        return None
+
+    try:
+        mins = _parse_cron_field(parts[0], minimum=0, maximum=59)
+        hours = _parse_cron_field(parts[1], minimum=0, maximum=23)
+        dom = _parse_cron_field(parts[2], minimum=1, maximum=31)
+        month = _parse_cron_field(parts[3], minimum=1, maximum=12)
+        dow = _parse_cron_field(parts[4], minimum=0, maximum=6)
+    except Exception:
+        return None
+
+    start = now_utc.astimezone(dt.timezone.utc).replace(second=0, microsecond=0) + dt.timedelta(minutes=1)
+    # 1 year scan window in minutes.
+    for offset in range(0, 60 * 24 * 366):
+        cur = start + dt.timedelta(minutes=offset)
+        if cur.month not in month:
+            continue
+        if cur.day not in dom:
+            continue
+        if cur.hour not in hours:
+            continue
+        if cur.minute not in mins:
+            continue
+        # Python weekday(): Monday=0..Sunday=6 ; cron here uses Sunday=0.
+        cron_dow = (cur.weekday() + 1) % 7
+        if cron_dow not in dow:
+            continue
+        return cur
+    return None
+
+
+def _human_duration(seconds: int) -> str:
+    total = max(0, int(seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m"
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _parse_route_pin_prefix(raw_prompt: str) -> tuple[str | None, str]:
+    p = str(raw_prompt or "").strip()
+    lower = p.lower()
+    if lower == "!heavy":
+        return "heavy", ""
+    if lower.startswith("!heavy "):
+        return "heavy", p[len("!heavy ") :].strip()
+    if lower == "!light":
+        return "light", ""
+    if lower.startswith("!light "):
+        return "light", p[len("!light ") :].strip()
+    return None, p
 
 
 def _runtime_root() -> Path:
@@ -669,6 +802,18 @@ class DiscordPromptResult:
     files: list[OutboundDiscordFile]
 
 
+@dataclass
+class _QueuedPrompt:
+    lane: str
+    channel: Any
+    channel_id: int
+    prompt: str
+    author_id: int | None
+    guild_id: int | None
+    route_pin: str | None
+    future: asyncio.Future[DiscordPromptResult]
+
+
 def _dispatch_discord_send_file_tool(
     *,
     arguments_json: str,
@@ -937,6 +1082,7 @@ async def run_discord_bot(
     workspace: Path | None = None,
     tools_builder: Any = None,
     bot_label: str | None = None,
+    routing_default_pin: str | None = None,
 ) -> None:
     try:
         import discord  # type: ignore
@@ -1177,12 +1323,18 @@ async def run_discord_bot(
                 f"- `{p} reset` clear the current conversation session (messages + settings)",
                 f"- `{p} help` show this help",
                 f"- `{p} google connect|poll [connect_id]|status|disconnect` Google link commands",
+                "- `!heavy <prompt>` force heavy model for one message",
+                "- `!light <prompt>` force light model for one message",
+                "- `!status` show live health metrics",
+                "- `!schedule <natural-language request>` create a scheduled reminder job",
                 "",
                 "Slash commands:",
                 "- `/help` show this help",
                 "- `/claw <prompt>` chat",
                 "- `/reset` clear session (messages + settings)",
                 "- `/new` start a new conversation (keeps settings)",
+                "- `/status` show live health metrics",
+                "- `/schedule <request>` create a scheduled reminder job",
                 "- `/tools` list tools",
                 "- `/model [model]` show or set model override for the current conversation session",
                 "- `/temp [value]` show or set temperature override for the current conversation session",
@@ -1198,12 +1350,188 @@ async def run_discord_bot(
                 "Notes:",
                 f"- Session scope: `{resolved_session_scope}` ({scope_target}).",
                 "- Model/temp/tokens overrides persist per conversation session across restarts.",
+                f"- Routing default pin: `{routing_default_pin or 'auto'}` (per-message `!heavy`/`!light` overrides this).",
                 "- Use `default`/`auto`/`reset` to clear overrides for `/model`, `/temp`, `/tokens`.",
                 "- Message attachments are parsed and included (PDF + common text/code formats).",
                 f"- In tool mode, use `{_DISCORD_SEND_FILE_TOOL_NAME}` to attach files.",
                 "- Bot can attach local files via `[[send_file:path]]` (optional rename: `[[send_file:path as name.ext]]`).",
             ]
         )
+
+    def _session_start_epoch() -> float:
+        for key in ("FREECLAW_KAGGLE_SESSION_START_EPOCH", "FREECLAW_SESSION_START_EPOCH"):
+            raw = os.getenv(key)
+            if raw is None or not str(raw).strip():
+                continue
+            try:
+                return float(str(raw).strip())
+            except Exception:
+                continue
+        return float(started_s)
+
+    def _kaggle_remaining_seconds() -> int:
+        remaining = (_session_start_epoch() + 43200.0) - float(time.time())
+        return max(0, int(remaining))
+
+    def _backup_status_snapshot() -> dict[str, Any]:
+        path = Path(os.getenv("FREECLAW_BACKUP_STATUS_PATH") or "/tmp/freeclaw_backup_status.json").expanduser()
+        if not path.exists():
+            return {"last_success_iso": None, "last_success_epoch": None, "last_error": None}
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(obj, dict):
+                return {"last_success_iso": None, "last_success_epoch": None, "last_error": None}
+            return {
+                "last_success_iso": obj.get("last_success_iso"),
+                "last_success_epoch": obj.get("last_success_epoch"),
+                "last_error": obj.get("last_error"),
+            }
+        except Exception:
+            return {"last_success_iso": None, "last_success_epoch": None, "last_error": None}
+
+    def _memory_row_count() -> int | None:
+        if db_path is None:
+            return None
+        try:
+            with sqlite3.connect(str(db_path)) as con:
+                row = con.execute("SELECT COUNT(*) FROM mem_items;").fetchone()
+                if not row:
+                    return 0
+                return int(row[0] or 0)
+        except Exception:
+            return None
+
+    def _status_lines() -> list[str]:
+        uptime_s = max(0, int(time.time() - started_s))
+        remaining_s = _kaggle_remaining_seconds()
+        mem_rows = _memory_row_count()
+        latency = nim_latency_snapshot()
+        route = get_last_route_decision()
+        backup = _backup_status_snapshot()
+        active_model = (
+            str(route.get("model") or "").strip()
+            or str(usage_stats.get("last_model") or "").strip()
+            or str(getattr(client, "model", "") or "").strip()
+            or "auto"
+        )
+        route_reason = str(route.get("reason") or "n/a")
+        route_tokens = route.get("token_estimate")
+        route_at = route.get("logged_at")
+        pin = route.get("pin")
+        last_ms = latency.get("last_ms")
+        avg_ms = latency.get("avg_ms_10")
+        samples = int(latency.get("samples") or 0)
+        last_ms_txt = f"{float(last_ms):.1f} ms" if isinstance(last_ms, (int, float)) else "n/a"
+        avg_ms_txt = f"{float(avg_ms):.1f} ms" if isinstance(avg_ms, (int, float)) else "n/a"
+        backup_iso = str(backup.get("last_success_iso") or "n/a")
+        lines = [
+            f"Uptime: `{_human_duration(uptime_s)}`",
+            f"Kaggle session remaining: `{_human_duration(remaining_s)}`",
+            f"NIM latency: `last={last_ms_txt}` `avg10={avg_ms_txt}` `samples={samples}`",
+            f"Memory rows: `{mem_rows if mem_rows is not None else 'n/a'}`",
+            f"Last backup: `{backup_iso}`",
+            f"Active routing model: `{active_model}`",
+            f"Routing reason: `{route_reason}`",
+            f"Routing tokens estimate: `{route_tokens if route_tokens is not None else 'n/a'}`",
+            f"Routing pin: `{pin or routing_default_pin or 'auto'}`",
+            f"Routing decision time: `{route_at or 'n/a'}`",
+        ]
+        err = backup.get("last_error")
+        if isinstance(err, str) and err.strip():
+            lines.append(f"Last backup error: `{err[:160]}`")
+        return lines
+
+    def _scheduled_jobs_load(path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {"version": 1, "jobs": []}
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(obj, list):
+                return {"version": 1, "jobs": obj}
+            if isinstance(obj, dict):
+                jobs = obj.get("jobs")
+                if isinstance(jobs, list):
+                    return {"version": int(obj.get("version") or 1), "jobs": jobs}
+        except Exception:
+            pass
+        return {"version": 1, "jobs": []}
+
+    def _scheduled_jobs_save(path: Path, doc: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(doc, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+
+    def _parse_schedule_with_fallback(request_text: str) -> dict[str, Any]:
+        txt = str(request_text or "").strip()
+        lower = txt.lower()
+        every_min = re.search(r"\bevery\s+(\d+)\s+minute", lower)
+        if every_min:
+            n = max(1, min(1440, int(every_min.group(1))))
+            action = txt
+            m = re.search(r"\bremind me to\b(.+)$", txt, flags=re.IGNORECASE)
+            if m:
+                action = m.group(1).strip()
+            return {"cron": f"*/{n} * * * *", "title": "Scheduled reminder", "action_text": action}
+
+        every_day = re.search(
+            r"\bevery\s+day\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+            lower,
+            flags=re.IGNORECASE,
+        )
+        if every_day:
+            h = int(every_day.group(1))
+            m = int(every_day.group(2) or "0")
+            ap = (every_day.group(3) or "").lower()
+            if ap == "pm" and h < 12:
+                h += 12
+            if ap == "am" and h == 12:
+                h = 0
+            if h > 23 or m > 59:
+                raise ValueError("Invalid time in schedule request")
+            action = txt
+            k = re.search(r"\bremind me to\b(.+)$", txt, flags=re.IGNORECASE)
+            if k:
+                action = k.group(1).strip()
+            return {"cron": f"{m} {h} * * *", "title": "Daily reminder", "action_text": action}
+
+        raise ValueError("Could not parse schedule request")
+
+    def _parse_schedule_request_with_ai(request_text: str) -> dict[str, Any]:
+        txt = str(request_text or "").strip()
+        if not txt:
+            raise ValueError("Schedule request is empty")
+        system = (
+            "You convert natural-language reminders into JSON.\n"
+            "Return JSON only (no markdown), with keys: cron, title, action_text.\n"
+            "Constraints:\n"
+            "- cron must be 5-field UTC cron.\n"
+            f"- {_SUPPORTED_CRON_NOTICE}\n"
+            "- title <= 80 chars.\n"
+            "- action_text is the reminder text to send to Discord.\n"
+            "- If request is ambiguous, make the safest reasonable assumption.\n"
+        )
+        parse_messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": txt},
+        ]
+        resp = client.chat(
+            messages=parse_messages,
+            temperature=0.0,
+            max_tokens=280,
+            tools=None,
+        )
+        parsed_raw = _extract_json_object_from_text(client.extract_text(resp))
+        if not isinstance(parsed_raw, dict):
+            return _parse_schedule_with_fallback(txt)
+        cron = str(parsed_raw.get("cron") or "").strip()
+        title = str(parsed_raw.get("title") or "Scheduled reminder").strip()[:80]
+        action_text = str(parsed_raw.get("action_text") or txt).strip()
+        if not cron:
+            return _parse_schedule_with_fallback(txt)
+        if not action_text:
+            action_text = txt
+        return {"cron": cron, "title": title or "Scheduled reminder", "action_text": action_text}
 
     async def _send_to_channel(*, channel: Any, payload: DiscordPromptResult) -> None:
         chunks = list(payload.chunks or [])
@@ -1756,12 +2084,82 @@ async def run_discord_bot(
             super().__init__(intents=intents)
             self.tree = app_commands.CommandTree(self)
             self._guild_synced = False
+            self._prompt_queue: asyncio.PriorityQueue[tuple[int, int, _QueuedPrompt | None]] = asyncio.PriorityQueue()
+            self._prompt_workers: list[asyncio.Task[None]] = []
+            self._prompt_seq = 0
 
         async def setup_hook(self) -> None:
+            if not self._prompt_workers:
+                self._prompt_workers.append(asyncio.create_task(self._queue_worker(), name="freeclaw-discord-prompt-worker"))
             try:
                 await self.tree.sync()
             except Exception as e:
                 log.warning("discord slash command sync failed: %s", e)
+
+        async def close(self) -> None:
+            if self._prompt_workers:
+                for _ in self._prompt_workers:
+                    self._prompt_seq += 1
+                    await self._prompt_queue.put((99, self._prompt_seq, None))
+                await asyncio.gather(*self._prompt_workers, return_exceptions=True)
+                self._prompt_workers.clear()
+            await super().close()
+
+        async def _queue_worker(self) -> None:
+            while True:
+                _priority, _seq, item = await self._prompt_queue.get()
+                try:
+                    if item is None:
+                        return
+                    try:
+                        res = await self._process_prompt(
+                            channel=item.channel,
+                            channel_id=item.channel_id,
+                            prompt=item.prompt,
+                            author_id=item.author_id,
+                            guild_id=item.guild_id,
+                            route_pin=item.route_pin,
+                        )
+                        if not item.future.done():
+                            item.future.set_result(res)
+                    except Exception as e:
+                        if not item.future.done():
+                            item.future.set_exception(e)
+                finally:
+                    self._prompt_queue.task_done()
+
+        async def _run_prompt(
+            self,
+            *,
+            channel: Any,
+            channel_id: int,
+            prompt: str,
+            author_id: int | None = None,
+            guild_id: int | None = None,
+            lane: str = "interactive",
+            route_pin: str | None = None,
+        ) -> DiscordPromptResult:
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future[DiscordPromptResult] = loop.create_future()
+            priority = 1 if str(lane).strip().lower() == "background" else 0
+            self._prompt_seq += 1
+            await self._prompt_queue.put(
+                (
+                    priority,
+                    self._prompt_seq,
+                    _QueuedPrompt(
+                        lane=("background" if priority == 1 else "interactive"),
+                        channel=channel,
+                        channel_id=int(channel_id),
+                        prompt=str(prompt or ""),
+                        author_id=(None if author_id is None else int(author_id)),
+                        guild_id=(None if guild_id is None else int(guild_id)),
+                        route_pin=route_pin,
+                        future=fut,
+                    ),
+                )
+            )
+            return await fut
 
         async def on_ready(self) -> None:
             assert self.user is not None
@@ -1782,7 +2180,7 @@ async def run_discord_bot(
                 usage_stats["last_seen_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
             _write_runtime_status()
 
-        async def _run_prompt(
+        async def _process_prompt(
             self,
             *,
             channel: Any,
@@ -1790,6 +2188,7 @@ async def run_discord_bot(
             prompt: str,
             author_id: int | None = None,
             guild_id: int | None = None,
+            route_pin: str | None = None,
         ) -> DiscordPromptResult:
             assert self.user is not None
             bot_id = int(self.user.id)
@@ -1814,12 +2213,14 @@ async def run_discord_bot(
                 eff_max_tokens = sess.max_tokens if sess.max_tokens is not None else max_tokens
                 eff_model = sess.model if sess.model is not None else client.model
                 eff_client = client if eff_model == client.model else client.with_model(eff_model)
+                effective_route_pin = (route_pin or routing_default_pin or None)
                 log.info(
-                    "discord prompt start channel_id=%s session_key=%s author_id=%s model=%s prompt_chars=%d",
+                    "discord prompt start channel_id=%s session_key=%s author_id=%s model=%s route_pin=%s prompt_chars=%d",
                     int(channel_id),
                     conversation_key,
                     (int(author_id) if author_id is not None else -1),
                     (eff_model or "auto"),
+                    (effective_route_pin or "auto"),
                     len(prompt or ""),
                 )
 
@@ -1870,21 +2271,24 @@ async def run_discord_bot(
                         )
                     return dispatch_tool_call(ctx, name, arguments_json)
 
+                def _run_agent_with_route_context() -> Any:
+                    with route_pin_context(effective_route_pin):
+                        return run_agent(
+                            client=eff_client,
+                            messages=agent_msgs,
+                            temperature=float(eff_temp),
+                            max_tokens=int(eff_max_tokens),
+                            enable_tools=enable_tools,
+                            tool_ctx=tool_ctx,
+                            max_tool_steps=max_tool_steps,
+                            verbose_tools=verbose_tools,
+                            tools_builder=(_discord_tools_builder if enable_tools else None),
+                            tool_dispatcher=(_discord_tool_dispatcher if enable_tools else None),
+                        )
+
                 try:
                     agent_msgs = [dict(m) for m in base_agent_msgs]
-                    result = await asyncio.to_thread(
-                        run_agent,
-                        client=eff_client,
-                        messages=agent_msgs,
-                        temperature=float(eff_temp),
-                        max_tokens=int(eff_max_tokens),
-                        enable_tools=enable_tools,
-                        tool_ctx=tool_ctx,
-                        max_tool_steps=max_tool_steps,
-                        verbose_tools=verbose_tools,
-                        tools_builder=(_discord_tools_builder if enable_tools else None),
-                        tool_dispatcher=(_discord_tool_dispatcher if enable_tools else None),
-                    )
+                    result = await asyncio.to_thread(_run_agent_with_route_context)
                 except Exception as e:
                     log.exception("run_agent failed (channel_id=%s)", channel_id)
                     # Show a compact error in-chat to aid debugging; details are in logs.
@@ -1906,13 +2310,16 @@ async def run_discord_bot(
                     # Fallback: retry once without tools (some providers/models behave badly when tools are present).
                     recovered = False
                     try:
-                        resp2 = await asyncio.to_thread(
-                            eff_client.chat,
-                            messages=[dict(m) for m in base_agent_msgs],
-                            temperature=float(eff_temp),
-                            max_tokens=int(eff_max_tokens),
-                            tools=None,
-                        )
+                        def _retry_chat_no_tools() -> dict[str, Any]:
+                            with route_pin_context(effective_route_pin):
+                                return eff_client.chat(
+                                    messages=[dict(m) for m in base_agent_msgs],
+                                    temperature=float(eff_temp),
+                                    max_tokens=int(eff_max_tokens),
+                                    tools=None,
+                                )
+
+                        resp2 = await asyncio.to_thread(_retry_chat_no_tools)
                         text2 = (eff_client.extract_text(resp2) or "").strip()
                         if text2:
                             recovered = True
@@ -1995,6 +2402,7 @@ async def run_discord_bot(
             triggered = False
             prompt = ""
             explicit_cmd = False
+            route_pin_override: str | None = None
 
             if content.startswith(prefix):
                 triggered = True
@@ -2005,6 +2413,25 @@ async def run_discord_bot(
                 triggered = True
                 explicit_cmd = True
                 prompt = _strip_bot_mention(content, self.user.id)
+            elif content.lower().startswith("!heavy"):
+                triggered = True
+                explicit_cmd = True
+                route_pin_override = "heavy"
+                prompt = content[len("!heavy") :].strip()
+            elif content.lower().startswith("!light"):
+                triggered = True
+                explicit_cmd = True
+                route_pin_override = "light"
+                prompt = content[len("!light") :].strip()
+            elif content.lower().strip() == "!status":
+                triggered = True
+                explicit_cmd = True
+                prompt = "status"
+            elif content.lower().startswith("!schedule"):
+                triggered = True
+                explicit_cmd = True
+                tail = content[len("!schedule") :].strip()
+                prompt = f"schedule {tail}".strip()
             elif respond_to_all and not author_is_bot and (content or has_attachments):
                 triggered = True
                 prompt = content
@@ -2034,11 +2461,12 @@ async def run_discord_bot(
             if not triggered:
                 return
             log.debug(
-                "discord message trigger channel_id=%s author_id=%s author_is_bot=%s explicit_cmd=%s attachments=%s",
+                "discord message trigger channel_id=%s author_id=%s author_is_bot=%s explicit_cmd=%s route_pin=%s attachments=%s",
                 int(channel_id),
                 int(message.author.id),
                 bool(author_is_bot),
                 bool(explicit_cmd),
+                (route_pin_override or "auto"),
                 bool(has_attachments),
             )
 
@@ -2046,9 +2474,18 @@ async def run_discord_bot(
             if has_attachments:
                 attachments_block = await _build_attachments_prompt_block(list(message.attachments))
 
+            if explicit_cmd:
+                pref_pin, stripped_prompt = _parse_route_pin_prefix(prompt)
+                if pref_pin in {"heavy", "light"}:
+                    route_pin_override = pref_pin
+                    prompt = stripped_prompt
+
             if explicit_cmd and not prompt and not attachments_block:
                 await message.channel.send(
-                    f"Usage: `{prefix} <prompt>` or `{prefix} new` or `{prefix} reset` or `{prefix} help`"
+                    (
+                        f"Usage: `{prefix} <prompt>` or `{prefix} new` or `{prefix} reset` or `{prefix} help`\n"
+                        "Also: `!heavy <prompt>`, `!light <prompt>`, `!status`, `!schedule <request>`"
+                    )
                 )  # type: ignore[attr-defined]
                 return
 
@@ -2081,6 +2518,98 @@ async def run_discord_bot(
                 except Exception as e:
                     text = f"Google command error: {e}"
                 for ch in _split_discord_message(text):
+                    await message.channel.send(ch)  # type: ignore[attr-defined]
+                return
+
+            if explicit_cmd and prompt.lower() in {"status", "!status"}:
+                try:
+                    embed = discord.Embed(  # type: ignore[attr-defined]
+                        title="Freeclaw Status",
+                        description="\n".join(_status_lines()),
+                        color=0x2ECC71,
+                        timestamp=dt.datetime.now(dt.timezone.utc),
+                    )
+                    await message.channel.send(embed=embed)  # type: ignore[attr-defined]
+                except Exception:
+                    for ch in _split_discord_message("\n".join(_status_lines())):
+                        await message.channel.send(ch)  # type: ignore[attr-defined]
+                return
+
+            if explicit_cmd and (prompt.lower().startswith("schedule") or prompt.lower().startswith("!schedule")):
+                clean_prompt = prompt.strip()
+                if clean_prompt.lower().startswith("!schedule"):
+                    request_text = clean_prompt[len("!schedule") :].strip()
+                else:
+                    request_text = clean_prompt[len("schedule") :].strip()
+                if not request_text:
+                    await message.channel.send(
+                        f"Usage: `!schedule every day at 7:00 AM remind me to back up memory`\n{_SUPPORTED_CRON_NOTICE}"
+                    )  # type: ignore[attr-defined]
+                    return
+                try:
+                    parsed = await asyncio.to_thread(_parse_schedule_request_with_ai, request_text)
+                except Exception as e:
+                    try:
+                        parsed = _parse_schedule_with_fallback(request_text)
+                    except Exception:
+                        await message.channel.send(
+                            f"Could not parse schedule request: {type(e).__name__}: {e}\n{_SUPPORTED_CRON_NOTICE}"
+                        )  # type: ignore[attr-defined]
+                        return
+
+                cron_expr = str(parsed.get("cron") or "").strip()
+                action_text = str(parsed.get("action_text") or request_text).strip()
+                title = str(parsed.get("title") or "Scheduled reminder").strip()[:80] or "Scheduled reminder"
+                next_run = _cron_next_run_utc(cron_expr, now_utc=dt.datetime.now(dt.timezone.utc))
+                if not cron_expr or next_run is None:
+                    await message.channel.send(
+                        f"Unsupported or invalid cron expression `{cron_expr or '(empty)'}`.\n{_SUPPORTED_CRON_NOTICE}"
+                    )  # type: ignore[attr-defined]
+                    return
+
+                jobs_path = _scheduled_jobs_path(ws)
+                job_doc = await asyncio.to_thread(_scheduled_jobs_load, jobs_path)
+                jobs_raw = job_doc.get("jobs")
+                jobs = list(jobs_raw) if isinstance(jobs_raw, list) else []
+                now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+                job_id = f"job-{uuid.uuid4().hex[:10]}"
+                new_job = {
+                    "id": job_id,
+                    "title": title,
+                    "enabled": True,
+                    "created_at": now_iso,
+                    "created_by": {
+                        "bot_id": int(self.user.id),
+                        "discord_user_id": int(message.author.id),
+                        "discord_channel_id": int(channel_id),
+                    },
+                    "request_text": request_text,
+                    "schedule": {
+                        "cron": cron_expr,
+                        "timezone": "UTC",
+                    },
+                    "action": {
+                        "type": "discord_message",
+                        "message": action_text,
+                    },
+                    "last_run_at": None,
+                    "last_run_status": None,
+                    "next_run_at": next_run.isoformat(timespec="seconds"),
+                }
+                jobs.append(new_job)
+                job_doc["version"] = int(job_doc.get("version") or 1)
+                job_doc["jobs"] = jobs
+                await asyncio.to_thread(_scheduled_jobs_save, jobs_path, job_doc)
+                lines = [
+                    "Scheduled job created.",
+                    f"- id: `{job_id}`",
+                    f"- title: `{title}`",
+                    f"- cron (UTC): `{cron_expr}`",
+                    f"- next_run_at: `{next_run.isoformat(timespec='seconds')}`",
+                    f"- action: `{action_text[:180]}`",
+                    f"- jobs_path: `{jobs_path}`",
+                ]
+                for ch in _split_discord_message("\n".join(lines)):
                     await message.channel.send(ch)  # type: ignore[attr-defined]
                 return
 
@@ -2139,6 +2668,8 @@ async def run_discord_bot(
                     prompt=final_prompt,
                     author_id=int(message.author.id),
                     guild_id=(int(message.guild.id) if getattr(message, "guild", None) is not None else None),
+                    lane="interactive",
+                    route_pin=route_pin_override,
                 )
             await _send_to_channel(channel=message.channel, payload=payload)
 
@@ -2184,6 +2715,8 @@ async def run_discord_bot(
             prompt=prompt.strip(),
             author_id=int(interaction.user.id),
             guild_id=(int(interaction.guild_id) if getattr(interaction, "guild_id", None) is not None else None),
+            lane="interactive",
+            route_pin=None,
         )
         await _send_to_followup(interaction=interaction, payload=payload, ephemeral=False)
 
@@ -2271,6 +2804,105 @@ async def run_discord_bot(
         await interaction.response.send_message(chunks[0], ephemeral=True)  # type: ignore[attr-defined]
         for ch in chunks[1:]:
             await interaction.followup.send(ch, ephemeral=True)  # type: ignore[attr-defined]
+
+    @client_app.tree.command(name="status", description="Show live bot health metrics.")  # type: ignore[attr-defined]
+    async def status_cmd(interaction: "discord.Interaction") -> None:  # type: ignore[name-defined]
+        if not await _gate_interaction(interaction):
+            return
+        try:
+            embed = discord.Embed(  # type: ignore[attr-defined]
+                title="Freeclaw Status",
+                description="\n".join(_status_lines()),
+                color=0x2ECC71,
+                timestamp=dt.datetime.now(dt.timezone.utc),
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)  # type: ignore[attr-defined]
+        except Exception:
+            await interaction.response.send_message("\n".join(_status_lines()), ephemeral=True)  # type: ignore[attr-defined]
+
+    @client_app.tree.command(name="schedule", description="Create a scheduled reminder job.")  # type: ignore[attr-defined]
+    async def schedule_cmd(interaction: "discord.Interaction", request: str) -> None:  # type: ignore[name-defined]
+        if not await _gate_interaction(interaction):
+            return
+        channel = interaction.channel
+        if channel is None:
+            await interaction.response.send_message("No channel found.", ephemeral=True)  # type: ignore[attr-defined]
+            return
+        request_text = str(request or "").strip()
+        if not request_text:
+            await interaction.response.send_message(  # type: ignore[attr-defined]
+                f"Usage: `/schedule request:every day at 7:00 AM remind me to back up memory`\n{_SUPPORTED_CRON_NOTICE}",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            parsed = await asyncio.to_thread(_parse_schedule_request_with_ai, request_text)
+        except Exception as e:
+            try:
+                parsed = _parse_schedule_with_fallback(request_text)
+            except Exception:
+                await interaction.response.send_message(  # type: ignore[attr-defined]
+                    f"Could not parse schedule request: {type(e).__name__}: {e}\n{_SUPPORTED_CRON_NOTICE}",
+                    ephemeral=True,
+                )
+                return
+
+        cron_expr = str(parsed.get("cron") or "").strip()
+        action_text = str(parsed.get("action_text") or request_text).strip()
+        title = str(parsed.get("title") or "Scheduled reminder").strip()[:80] or "Scheduled reminder"
+        next_run = _cron_next_run_utc(cron_expr, now_utc=dt.datetime.now(dt.timezone.utc))
+        if not cron_expr or next_run is None:
+            await interaction.response.send_message(  # type: ignore[attr-defined]
+                f"Unsupported or invalid cron expression `{cron_expr or '(empty)'}`.\n{_SUPPORTED_CRON_NOTICE}",
+                ephemeral=True,
+            )
+            return
+
+        assert client_app.user is not None
+        jobs_path = _scheduled_jobs_path(ws)
+        job_doc = await asyncio.to_thread(_scheduled_jobs_load, jobs_path)
+        jobs_raw = job_doc.get("jobs")
+        jobs = list(jobs_raw) if isinstance(jobs_raw, list) else []
+        now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        job_id = f"job-{uuid.uuid4().hex[:10]}"
+        new_job = {
+            "id": job_id,
+            "title": title,
+            "enabled": True,
+            "created_at": now_iso,
+            "created_by": {
+                "bot_id": int(client_app.user.id),
+                "discord_user_id": int(interaction.user.id),
+                "discord_channel_id": int(channel.id),
+            },
+            "request_text": request_text,
+            "schedule": {
+                "cron": cron_expr,
+                "timezone": "UTC",
+            },
+            "action": {
+                "type": "discord_message",
+                "message": action_text,
+            },
+            "last_run_at": None,
+            "last_run_status": None,
+            "next_run_at": next_run.isoformat(timespec="seconds"),
+        }
+        jobs.append(new_job)
+        job_doc["version"] = int(job_doc.get("version") or 1)
+        job_doc["jobs"] = jobs
+        await asyncio.to_thread(_scheduled_jobs_save, jobs_path, job_doc)
+        lines = [
+            "Scheduled job created.",
+            f"- id: `{job_id}`",
+            f"- title: `{title}`",
+            f"- cron (UTC): `{cron_expr}`",
+            f"- next_run_at: `{next_run.isoformat(timespec='seconds')}`",
+            f"- action: `{action_text[:180]}`",
+            f"- jobs_path: `{jobs_path}`",
+        ]
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)  # type: ignore[attr-defined]
 
     @client_app.tree.command(name="model", description="Show or set the model for the current conversation session.")  # type: ignore[attr-defined]
     async def model_cmd(interaction: "discord.Interaction", model: str | None = None) -> None:  # type: ignore[name-defined]
